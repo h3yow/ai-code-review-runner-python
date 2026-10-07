@@ -82,3 +82,45 @@ async def test_get_and_cancel_endpoints(client):
 
     assert (await client.get("/tasks/nope")).status_code == 404
     assert (await client.post("/tasks/nope/cancel")).status_code == 404
+
+
+async def test_submit_with_scope_and_per_file_results(client, tmp_path):
+    """End to end: scope in, per-file outcomes + summary out."""
+    repo = tmp_path / "repo2"
+    repo.mkdir()
+    (repo / "ok.py").write_text("A = 1  # TODO\n")
+    (repo / "blob.py").write_bytes(b"\xff\xfe binary")
+    (repo / "skip.py").write_text("B = 2\n")
+    payload = {
+        "idempotency_key": "k-scope",
+        "repo_path": str(repo),
+        "scope": {"exclude": ["skip.py"]},
+    }
+    r = await client.post("/tasks", json=payload)
+    assert r.status_code == 201
+    task_id = r.json()["task_id"]
+    assert r.json()["scope"]["exclude"] == ["skip.py"]
+
+    for _ in range(50):
+        await asyncio.sleep(0.05)
+        g = await client.get(f"/tasks/{task_id}")
+        if g.json()["state"] in ("SUCCEEDED", "FAILED"):
+            break
+    body = g.json()
+    assert body["state"] == "SUCCEEDED"
+    by_path = {f["path"]: f for f in body["files"]}
+    assert by_path["ok.py"]["status"] == "REVIEWED"
+    assert by_path["blob.py"]["status"] == "FAILED"
+    assert by_path["blob.py"]["error_category"] == "NOT_TEXT"
+    assert by_path["skip.py"]["status"] == "EXCLUDED"
+    assert by_path["skip.py"]["excluded_by"] == "skip.py"
+    assert body["summary"]["has_skips_or_failures"] is True
+
+    # idempotent replay with the same scope returns the same task
+    replay = await client.post("/tasks", json=payload)
+    assert replay.status_code == 200
+    assert replay.json()["task_id"] == task_id
+    # same key with a different scope is a conflict
+    conflict = await client.post("/tasks", json={
+        **payload, "scope": {"exclude": ["other.py"]}})
+    assert conflict.status_code == 409

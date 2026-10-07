@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 from review_service.models import (
     ErrorCategory,
     ReviewRequest,
+    ScopeConfig,
     TaskRecord,
     TaskState,
     ensure_transition,
@@ -38,14 +39,24 @@ CREATE TABLE IF NOT EXISTS tasks (
     fingerprint TEXT NOT NULL,
     repo_path TEXT NOT NULL,
     rules TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT '{}',
     state TEXT NOT NULL,
     error_category TEXT,
     error_detail TEXT,
     findings TEXT NOT NULL DEFAULT '[]',
+    file_results TEXT NOT NULL DEFAULT '[]',
+    summary TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
 """
+
+#: Columns added after the initial schema; migrated idempotently on open.
+_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("scope", "scope TEXT NOT NULL DEFAULT '{}'"),
+    ("file_results", "file_results TEXT NOT NULL DEFAULT '[]'"),
+    ("summary", "summary TEXT NOT NULL DEFAULT '{}'"),
+)
 
 
 class TaskStore:
@@ -56,7 +67,18 @@ class TaskStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._lock = threading.Lock()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the initial schema, idempotently."""
+        existing = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(tasks)")
+        }
+        for name, ddl in _MIGRATIONS:
+            if name not in existing:
+                self._conn.execute(f"ALTER TABLE tasks ADD COLUMN {ddl}")
+        self._conn.commit()
 
     # -- row mapping ------------------------------------------------------
 
@@ -65,7 +87,9 @@ class TaskStore:
             task_id=row["task_id"],
             idempotency_key=row["idempotency_key"],
             request=ReviewRequest(
-                repo_path=row["repo_path"], rules=tuple(json.loads(row["rules"]))
+                repo_path=row["repo_path"],
+                rules=tuple(json.loads(row["rules"])),
+                scope=ScopeConfig.from_dict(json.loads(row["scope"])),
             ),
             state=TaskState(row["state"]),
             error_category=(
@@ -73,6 +97,8 @@ class TaskStore:
             ),
             error_detail=row["error_detail"],
             findings=json.loads(row["findings"]),
+            file_results=json.loads(row["file_results"]),
+            summary=json.loads(row["summary"]),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -97,18 +123,22 @@ class TaskStore:
             record.created_at = record.updated_at = now
             self._conn.execute(
                 "INSERT INTO tasks (task_id, idempotency_key, fingerprint, repo_path,"
-                " rules, state, error_category, error_detail, findings, created_at,"
-                " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                " rules, scope, state, error_category, error_detail, findings,"
+                " file_results, summary, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     record.task_id,
                     record.idempotency_key,
                     record.request.fingerprint(),
                     record.request.repo_path,
                     json.dumps(sorted(record.request.rules)),
+                    json.dumps(record.request.scope.to_dict()),
                     record.state.value,
                     None,
                     None,
                     "[]",
+                    "[]",
+                    "{}",
                     record.created_at,
                     record.updated_at,
                 ),
@@ -141,14 +171,21 @@ class TaskStore:
                 )
             if "findings" in fields:
                 record.findings = list(fields["findings"])  # type: ignore[arg-type]
+            if "file_results" in fields:
+                record.file_results = list(fields["file_results"])  # type: ignore[arg-type]
+            if "summary" in fields:
+                record.summary = dict(fields["summary"])  # type: ignore[arg-type]
             self._conn.execute(
                 "UPDATE tasks SET state=?, error_category=?, error_detail=?,"
-                " findings=?, updated_at=? WHERE task_id=?",
+                " findings=?, file_results=?, summary=?, updated_at=?"
+                " WHERE task_id=?",
                 (
                     record.state.value,
                     record.error_category.value if record.error_category else None,
                     record.error_detail,
                     json.dumps(record.findings),
+                    json.dumps(record.file_results),
+                    json.dumps(record.summary),
                     record.updated_at,
                     task_id,
                 ),
@@ -174,11 +211,14 @@ class TaskStore:
                 # Bypass the state machine: recovery is a system-level reset.
                 rec.state = TaskState.QUEUED
                 rec.findings = []
+                rec.file_results = []
+                rec.summary = {}
                 rec.error_category = None
                 rec.error_detail = None
                 rec.updated_at = time.time()
                 self._conn.execute(
-                    "UPDATE tasks SET state=?, findings='[]', error_category=NULL,"
+                    "UPDATE tasks SET state=?, findings='[]', file_results='[]',"
+                    " summary='{}', error_category=NULL,"
                     " error_detail=NULL, updated_at=? WHERE task_id=?",
                     (rec.state.value, rec.updated_at, rec.task_id),
                 )

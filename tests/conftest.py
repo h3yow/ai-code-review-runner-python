@@ -39,9 +39,10 @@ def make_service(db_path):
     created: list[ReviewService] = []
 
     def factory(max_concurrency: int = 2, max_queue: int = 8,
-                path: str | None = None) -> ReviewService:
+                path: str | None = None, limits=None) -> ReviewService:
         svc = ReviewService(TaskStore(path or db_path),
-                            Scheduler(max_concurrency, max_queue))
+                            Scheduler(max_concurrency, max_queue),
+                            limits=limits)
         created.append(svc)
         return svc
 
@@ -63,8 +64,15 @@ class BlockingPipeline:
         self.calls: list[str] = []
         self._findings = findings or []
 
-    def __call__(self, repo_path: str, rules: tuple[str, ...]) -> list[dict]:
+    def __call__(self, repo_path: str, rules: tuple[str, ...], *args) -> object:
+        from review_service.pipeline import PipelineResult
+
         self.calls.append(repo_path)
         self.entered.set()
         self.release.wait(timeout=10)
-        return list(self._findings)
+        return PipelineResult(
+            findings=list(self._findings),
+            files=[],
+            summary={"reviewed": 0, "excluded": 0, "failed": 0,
+                     "truncated": False, "has_skips_or_failures": False},
+        )

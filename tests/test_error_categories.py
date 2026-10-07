@@ -47,14 +47,20 @@ async def test_unknown_rule_is_unsupported(make_service, repo_dir):
 
 
 async def test_syntax_error_is_parse_error(make_service, tmp_path):
+    """A syntax error is now a per-file PARSE_ERROR failure: the task itself
+    succeeds and the summary makes the failure visible."""
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / "broken.py").write_text("def broken(:\n")
     svc = make_service()
     await svc.start()
     final = await _run_and_wait(svc, "k-parse", str(repo))
-    assert final.state is TaskState.FAILED
-    assert final.error_category is ErrorCategory.PARSE_ERROR
+    assert final.state is TaskState.SUCCEEDED
+    assert final.summary["failed"] == 1
+    assert final.summary["has_skips_or_failures"] is True
+    (entry,) = [f for f in final.file_results if f["path"] == "broken.py"]
+    assert entry["status"] == "FAILED"
+    assert entry["error_category"] == ErrorCategory.PARSE_ERROR.value
 
 
 async def test_categories_are_distinguishable(make_service, tmp_path):

@@ -55,8 +55,9 @@ async def test_restart_recovers_inflight_tasks(db_path, repo_dir):
         final = await _wait_terminal(svc, ids[key])
         assert final.state is TaskState.SUCCEEDED, (key, final)
         # exactly one run's worth of findings: stale partial results cleared
+        # (findings are keyed by repo-relative path for reproducibility)
         assert final.findings == [
-            {"rule": "no-todo", "path": f"{repo_dir}/ok.py", "line": 2,
+            {"rule": "no-todo", "path": "ok.py", "line": 2,
              "message": "TODO comment found"}
         ]
 

@@ -9,7 +9,9 @@ import uuid
 from review_service.models import (
     ErrorCategory,
     InvalidTransitionError,
+    ReviewLimits,
     ReviewRequest,
+    ScopeConfig,
     TaskRecord,
     TaskState,
     TERMINAL_STATES,
@@ -22,9 +24,11 @@ logger = logging.getLogger(__name__)
 
 
 class ReviewService:
-    def __init__(self, store: TaskStore, scheduler: Scheduler) -> None:
+    def __init__(self, store: TaskStore, scheduler: Scheduler,
+                 limits: ReviewLimits | None = None) -> None:
         self._store = store
         self._scheduler = scheduler
+        self._limits = limits or ReviewLimits()
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -45,14 +49,16 @@ class ReviewService:
     # -- submission -----------------------------------------------------------
 
     async def submit(self, idempotency_key: str, repo_path: str,
-                     rules: tuple[str, ...] = ()) -> tuple[TaskRecord, bool]:
+                     rules: tuple[str, ...] = (),
+                     scope: ScopeConfig | None = None) -> tuple[TaskRecord, bool]:
         """Submit a review task. Returns (record, created_new).
 
         Replaying an existing idempotency key with the same payload returns
         the original record with created_new=False. A conflicting payload
         raises IdempotencyConflictError.
         """
-        request = ReviewRequest(repo_path=repo_path, rules=rules)
+        request = ReviewRequest(repo_path=repo_path, rules=rules,
+                                scope=scope or ScopeConfig())
         record = TaskRecord(
             task_id=uuid.uuid4().hex,
             idempotency_key=idempotency_key,
@@ -66,8 +72,9 @@ class ReviewService:
             )
             return record, False
         logger.info(
-            "task_id=%s idempotency_key=%s accepted repo_path=%s rules=%s",
+            "task_id=%s idempotency_key=%s accepted repo_path=%s rules=%s scope=%s",
             record.task_id, record.idempotency_key, repo_path, sorted(rules),
+            request.scope.to_dict(),
         )
         self._store.transition(record.task_id, TaskState.QUEUED)
         try:
@@ -111,8 +118,9 @@ class ReviewService:
             record = self._store.get(task_id)
             assert record is not None
             try:
-                findings = await asyncio.to_thread(
-                    run_pipeline, record.request.repo_path, record.request.rules
+                result = await asyncio.to_thread(
+                    run_pipeline, record.request.repo_path, record.request.rules,
+                    record.request.scope, self._limits,
                 )
             except asyncio.CancelledError:
                 # State is written by cancel(); a cancelled task must not
@@ -131,7 +139,14 @@ class ReviewService:
                     error_category=ErrorCategory.INTERNAL, error_detail=str(exc),
                 )
                 return
-            self._transition_terminal(task_id, TaskState.SUCCEEDED, findings=findings)
+            logger.info(
+                "task_id=%s idempotency_key=%s pipeline done: %s",
+                task_id, record.idempotency_key, result.summary,
+            )
+            self._transition_terminal(
+                task_id, TaskState.SUCCEEDED, findings=result.findings,
+                file_results=result.files, summary=result.summary,
+            )
         return work
 
     def _transition_terminal(self, task_id: str, target: TaskState, **fields: object) -> None:
