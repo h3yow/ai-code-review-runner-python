@@ -11,8 +11,15 @@ import time
 logger = logging.getLogger(__name__)
 
 from review_service.models import (
+    CapacityConfig,
     ErrorCategory,
+    FileDisposition,
+    FileFailReason,
+    FileResult,
+    OverflowPolicy,
     ReviewRequest,
+    ScopeConfig,
+    ScopeSummary,
     TaskRecord,
     TaskState,
     ensure_transition,
@@ -38,14 +45,129 @@ CREATE TABLE IF NOT EXISTS tasks (
     fingerprint TEXT NOT NULL,
     repo_path TEXT NOT NULL,
     rules TEXT NOT NULL,
+    scope_json TEXT NOT NULL DEFAULT '{}',
+    capacity_json TEXT NOT NULL DEFAULT '{}',
     state TEXT NOT NULL,
     error_category TEXT,
     error_detail TEXT,
     findings TEXT NOT NULL DEFAULT '[]',
+    file_results TEXT NOT NULL DEFAULT '[]',
+    summary_json TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
 """
+
+#: Columns added after the initial schema; applied idempotently to old DBs.
+_MIGRATIONS = (
+    ("scope_json", "TEXT NOT NULL DEFAULT '{}'"),
+    ("capacity_json", "TEXT NOT NULL DEFAULT '{}'"),
+    ("file_results", "TEXT NOT NULL DEFAULT '[]'"),
+    ("summary_json", "TEXT"),
+)
+
+
+def _scope_to_json(scope: ScopeConfig) -> str:
+    return json.dumps(
+        {
+            "recursive": scope.recursive,
+            "include_dirs": list(scope.include_dirs),
+            "include_names": list(scope.include_names),
+            "include_suffixes": list(scope.include_suffixes),
+            "exclude_patterns": list(scope.exclude_patterns),
+        }
+    )
+
+
+def _scope_from_json(blob: str) -> ScopeConfig:
+    data = json.loads(blob or "{}")
+    return ScopeConfig(
+        recursive=data.get("recursive", True),
+        include_dirs=tuple(data.get("include_dirs", ())),
+        include_names=tuple(data.get("include_names", ())),
+        include_suffixes=tuple(data.get("include_suffixes", ())),
+        exclude_patterns=tuple(data.get("exclude_patterns", ())),
+    )
+
+
+def _capacity_to_json(cap: CapacityConfig) -> str:
+    return json.dumps(
+        {
+            "max_files": cap.max_files,
+            "max_total_bytes": cap.max_total_bytes,
+            "overflow_policy": cap.overflow_policy.value,
+        }
+    )
+
+
+def _capacity_from_json(blob: str) -> CapacityConfig:
+    data = json.loads(blob or "{}")
+    return CapacityConfig(
+        max_files=data.get("max_files", CapacityConfig().max_files),
+        max_total_bytes=data.get(
+            "max_total_bytes", CapacityConfig().max_total_bytes
+        ),
+        overflow_policy=OverflowPolicy(
+            data.get("overflow_policy", OverflowPolicy.REJECT.value)
+        ),
+    )
+
+
+def _file_result_to_json(fr: FileResult) -> dict:
+    return {
+        "path": fr.path,
+        "disposition": fr.disposition.value,
+        "findings": fr.findings,
+        "fail_reason": fr.fail_reason.value if fr.fail_reason else None,
+        "fail_detail": fr.fail_detail,
+        "excluded_by": fr.excluded_by,
+        "size_bytes": fr.size_bytes,
+    }
+
+
+def _file_result_from_json(data: dict) -> FileResult:
+    return FileResult(
+        path=data["path"],
+        disposition=FileDisposition(data["disposition"]),
+        findings=data.get("findings", []),
+        fail_reason=(
+            FileFailReason(data["fail_reason"]) if data.get("fail_reason") else None
+        ),
+        fail_detail=data.get("fail_detail"),
+        excluded_by=data.get("excluded_by"),
+        size_bytes=data.get("size_bytes", 0),
+    )
+
+
+def _summary_to_json(summary: ScopeSummary | None) -> str | None:
+    if summary is None:
+        return None
+    return json.dumps(
+        {
+            "total_in_scope": summary.total_in_scope,
+            "reviewed": summary.reviewed,
+            "excluded": summary.excluded,
+            "failed": summary.failed,
+            "skipped": summary.skipped,
+            "truncated": summary.truncated,
+            "rejected_by_limit": summary.rejected_by_limit,
+        }
+    )
+
+
+def _summary_from_json(blob: str | None) -> ScopeSummary | None:
+    if not blob:
+        return None
+    data = json.loads(blob)
+    return ScopeSummary(
+        total_in_scope=data.get("total_in_scope", 0),
+        reviewed=data.get("reviewed", 0),
+        excluded=data.get("excluded", 0),
+        failed=data.get("failed", 0),
+        skipped=data.get("skipped", 0),
+        truncated=data.get("truncated", False),
+        rejected_by_limit=data.get("rejected_by_limit"),
+    )
 
 
 class TaskStore:
@@ -56,16 +178,33 @@ class TaskStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._lock = threading.Lock()
+
+    def _migrate(self) -> None:
+        existing = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        for column, decl in _MIGRATIONS:
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {decl}")
+        self._conn.commit()
 
     # -- row mapping ------------------------------------------------------
 
     def _to_record(self, row: sqlite3.Row) -> TaskRecord:
+        keys = row.keys()
         return TaskRecord(
             task_id=row["task_id"],
             idempotency_key=row["idempotency_key"],
             request=ReviewRequest(
-                repo_path=row["repo_path"], rules=tuple(json.loads(row["rules"]))
+                repo_path=row["repo_path"],
+                rules=tuple(json.loads(row["rules"])),
+                scope=_scope_from_json(row["scope_json"])
+                if "scope_json" in keys else ScopeConfig(),
+                capacity=_capacity_from_json(row["capacity_json"])
+                if "capacity_json" in keys else CapacityConfig(),
             ),
             state=TaskState(row["state"]),
             error_category=(
@@ -73,6 +212,14 @@ class TaskStore:
             ),
             error_detail=row["error_detail"],
             findings=json.loads(row["findings"]),
+            file_results=(
+                [_file_result_from_json(d) for d in json.loads(row["file_results"])]
+                if "file_results" in keys else []
+            ),
+            summary=(
+                _summary_from_json(row["summary_json"])
+                if "summary_json" in keys else None
+            ),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -97,18 +244,23 @@ class TaskStore:
             record.created_at = record.updated_at = now
             self._conn.execute(
                 "INSERT INTO tasks (task_id, idempotency_key, fingerprint, repo_path,"
-                " rules, state, error_category, error_detail, findings, created_at,"
-                " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                " rules, scope_json, capacity_json, state, error_category,"
+                " error_detail, findings, file_results, summary_json, created_at,"
+                " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     record.task_id,
                     record.idempotency_key,
                     record.request.fingerprint(),
                     record.request.repo_path,
                     json.dumps(sorted(record.request.rules)),
+                    _scope_to_json(record.request.scope),
+                    _capacity_to_json(record.request.capacity),
                     record.state.value,
                     None,
                     None,
                     "[]",
+                    "[]",
+                    None,
                     record.created_at,
                     record.updated_at,
                 ),
@@ -141,14 +293,21 @@ class TaskStore:
                 )
             if "findings" in fields:
                 record.findings = list(fields["findings"])  # type: ignore[arg-type]
+            if "file_results" in fields:
+                record.file_results = list(fields["file_results"])  # type: ignore[arg-type]
+            if "summary" in fields:
+                record.summary = fields["summary"]  # type: ignore[assignment]
             self._conn.execute(
                 "UPDATE tasks SET state=?, error_category=?, error_detail=?,"
-                " findings=?, updated_at=? WHERE task_id=?",
+                " findings=?, file_results=?, summary_json=?, updated_at=?"
+                " WHERE task_id=?",
                 (
                     record.state.value,
                     record.error_category.value if record.error_category else None,
                     record.error_detail,
                     json.dumps(record.findings),
+                    json.dumps([_file_result_to_json(r) for r in record.file_results]),
+                    _summary_to_json(record.summary),
                     record.updated_at,
                     task_id,
                 ),
@@ -174,12 +333,15 @@ class TaskStore:
                 # Bypass the state machine: recovery is a system-level reset.
                 rec.state = TaskState.QUEUED
                 rec.findings = []
+                rec.file_results = []
+                rec.summary = None
                 rec.error_category = None
                 rec.error_detail = None
                 rec.updated_at = time.time()
                 self._conn.execute(
-                    "UPDATE tasks SET state=?, findings='[]', error_category=NULL,"
-                    " error_detail=NULL, updated_at=? WHERE task_id=?",
+                    "UPDATE tasks SET state=?, findings='[]', file_results='[]',"
+                    " summary_json=NULL, error_category=NULL, error_detail=NULL,"
+                    " updated_at=? WHERE task_id=?",
                     (rec.state.value, rec.updated_at, rec.task_id),
                 )
                 recovered.append(rec)

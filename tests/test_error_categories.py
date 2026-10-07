@@ -47,14 +47,27 @@ async def test_unknown_rule_is_unsupported(make_service, repo_dir):
 
 
 async def test_syntax_error_is_parse_error(make_service, tmp_path):
+    """A single unparsable file no longer fails the whole task: it is recorded
+    as a per-file PARSE_ERROR while sibling files are still reviewed."""
+    from review_service.models import FileDisposition
+
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / "broken.py").write_text("def broken(:\n")
+    (repo / "ok.py").write_text("x = 1  # TODO\n")
     svc = make_service()
     await svc.start()
     final = await _run_and_wait(svc, "k-parse", str(repo))
-    assert final.state is TaskState.FAILED
-    assert final.error_category is ErrorCategory.PARSE_ERROR
+    assert final.state is TaskState.SUCCEEDED  # task itself is not failed
+    by_path = {fr.path: fr for fr in final.file_results}
+    broken = by_path["broken.py"]
+    assert broken.disposition is FileDisposition.FAILED
+    assert broken.fail_reason.value == "PARSE_ERROR"
+    assert "syntax error" in (broken.fail_detail or "")
+    assert by_path["ok.py"].disposition is FileDisposition.REVIEWED
+    assert final.summary.failed == 1
+    assert final.summary.reviewed == 1
+    assert final.summary.has_skips_or_failures
 
 
 async def test_categories_are_distinguishable(make_service, tmp_path):

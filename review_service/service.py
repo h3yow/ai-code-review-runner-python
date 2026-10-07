@@ -7,9 +7,11 @@ import logging
 import uuid
 
 from review_service.models import (
+    CapacityConfig,
     ErrorCategory,
     InvalidTransitionError,
     ReviewRequest,
+    ScopeConfig,
     TaskRecord,
     TaskState,
     TERMINAL_STATES,
@@ -22,9 +24,15 @@ logger = logging.getLogger(__name__)
 
 
 class ReviewService:
-    def __init__(self, store: TaskStore, scheduler: Scheduler) -> None:
+    def __init__(
+        self,
+        store: TaskStore,
+        scheduler: Scheduler,
+        default_capacity: CapacityConfig | None = None,
+    ) -> None:
         self._store = store
         self._scheduler = scheduler
+        self._default_capacity = default_capacity or CapacityConfig()
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -44,15 +52,26 @@ class ReviewService:
 
     # -- submission -----------------------------------------------------------
 
-    async def submit(self, idempotency_key: str, repo_path: str,
-                     rules: tuple[str, ...] = ()) -> tuple[TaskRecord, bool]:
+    async def submit(
+        self,
+        idempotency_key: str,
+        repo_path: str,
+        rules: tuple[str, ...] = (),
+        scope: ScopeConfig | None = None,
+        capacity: CapacityConfig | None = None,
+    ) -> tuple[TaskRecord, bool]:
         """Submit a review task. Returns (record, created_new).
 
         Replaying an existing idempotency key with the same payload returns
         the original record with created_new=False. A conflicting payload
         raises IdempotencyConflictError.
         """
-        request = ReviewRequest(repo_path=repo_path, rules=rules)
+        request = ReviewRequest(
+            repo_path=repo_path,
+            rules=rules,
+            scope=scope or ScopeConfig(),
+            capacity=capacity or self._default_capacity,
+        )
         record = TaskRecord(
             task_id=uuid.uuid4().hex,
             idempotency_key=idempotency_key,
@@ -111,8 +130,12 @@ class ReviewService:
             record = self._store.get(task_id)
             assert record is not None
             try:
-                findings = await asyncio.to_thread(
-                    run_pipeline, record.request.repo_path, record.request.rules
+                result = await asyncio.to_thread(
+                    run_pipeline,
+                    record.request.repo_path,
+                    record.request.rules,
+                    record.request.scope,
+                    record.request.capacity,
                 )
             except asyncio.CancelledError:
                 # State is written by cancel(); a cancelled task must not
@@ -131,7 +154,18 @@ class ReviewService:
                     error_category=ErrorCategory.INTERNAL, error_detail=str(exc),
                 )
                 return
-            self._transition_terminal(task_id, TaskState.SUCCEEDED, findings=findings)
+            summary = result.summary
+            logger.info(
+                "task_id=%s reviewed=%d excluded=%d failed=%d skipped=%d truncated=%s",
+                task_id, summary.reviewed, summary.excluded, summary.failed,
+                summary.skipped, summary.truncated,
+            )
+            self._transition_terminal(
+                task_id, TaskState.SUCCEEDED,
+                findings=result.findings,
+                file_results=result.file_results,
+                summary=result.summary,
+            )
         return work
 
     def _transition_terminal(self, task_id: str, target: TaskState, **fields: object) -> None:

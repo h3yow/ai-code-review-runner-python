@@ -63,8 +63,10 @@ class BlockingPipeline:
         self.calls: list[str] = []
         self._findings = findings or []
 
-    def __call__(self, repo_path: str, rules: tuple[str, ...]) -> list[dict]:
+    def __call__(self, repo_path: str, rules: tuple[str, ...], scope=None,
+                 capacity=None):
         self.calls.append(repo_path)
         self.entered.set()
         self.release.wait(timeout=10)
-        return list(self._findings)
+        from review_service.pipeline import PipelineResult
+        return PipelineResult(findings=list(self._findings))
